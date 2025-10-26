@@ -1,53 +1,156 @@
-// Cloudflare Worker for Telegram Bot with Broadcast & Stats
-const TELEGRAM_BOT_TOKEN = 'YOUR_BOT_TOKEN_HERE';
-const ADMIN_IDS = [123456789, 987654321]; // Replace with your admin IDs
-const API_BASE_URL = 'https://yourdomain.com/api.php'; // Your API endpoint
-
-// User database (in production, use Cloudflare KV)
-let userDB = {
-    users: new Set(),
-    stats: {
-        total_users: 0,
-        active_today: 0,
-        premium_users: 0
+// worker.js - Main Telegram Bot
+export default {
+    async fetch(request, env, ctx) {
+        return await handleRequest(request, env);
     }
 };
 
-async function handleRequest(request) {
+async function handleRequest(request, env) {
     if (request.method === 'POST') {
-        const update = await request.json();
-        return handleUpdate(update);
+        try {
+            const update = await request.json();
+            return await handleUpdate(update, env);
+        } catch (error) {
+            return new Response(JSON.stringify({ error: 'Invalid JSON' }), { 
+                status: 400,
+                headers: { 'Content-Type': 'application/json' }
+            });
+        }
     }
-    
-    return new Response('OK', { status: 200 });
+
+    // GET request - show bot info
+    const html = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Premium VPN Bot</title>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
+            .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; border-radius: 10px; text-align: center; }
+            .feature { background: #f8f9fa; padding: 15px; margin: 10px 0; border-radius: 5px; border-left: 4px solid #667eea; }
+            .command { background: #e9ecef; padding: 10px; border-radius: 5px; font-family: monospace; margin: 5px 0; }
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <h1>🤖 Premium VPN Bot</h1>
+            <p>V2Ray Account Management System</p>
+        </div>
+        
+        <h2>🚀 Features</h2>
+        <div class="feature">✅ Free Trial Accounts (50GB, 7 Days)</div>
+        <div class="feature">✅ Premium Account Creation</div>
+        <div class="feature">✅ Account Status Checking</div>
+        <div class="feature">✅ Broadcast System</div>
+        <div class="feature">✅ Multi-Admin Support</div>
+        
+        <h2>📋 Commands</h2>
+        <div class="command">/start - Start the bot</div>
+        <div class="command">/trail - Get free trial</div>
+        <div class="command">/checkaccount - Check status</div>
+        <div class="command">/stats - View statistics</div>
+        
+        <p><strong>👨‍💻 Developer:</strong> Channel 404 Team</p>
+        <p><strong>📢 Channel:</strong> @premium_channel_404</p>
+    </body>
+    </html>`;
+
+    return new Response(html, {
+        headers: { 'Content-Type': 'text/html; charset=utf-8' }
+    });
 }
 
-async function handleUpdate(update) {
+// Bot token and configuration from environment variables
+const getConfig = (env) => ({
+    TELEGRAM_BOT_TOKEN: env.TELEGRAM_BOT_TOKEN || 'YOUR_BOT_TOKEN',
+    ADMIN_IDS: JSON.parse(env.ADMIN_IDS || '[123456789, 987654321]'),
+    API_BASE_URL: env.API_BASE_URL || 'https://yourdomain.com/api.php'
+});
+
+// User storage using Cloudflare KV
+class UserManager {
+    constructor(env) {
+        this.kv = env.USER_KV;
+    }
+
+    async saveUser(userId, username, firstName) {
+        const userKey = `user:${userId}`;
+        const userData = {
+            id: userId,
+            username: username,
+            firstName: firstName,
+            joinedAt: new Date().toISOString(),
+            lastActive: new Date().toISOString()
+        };
+        
+        await this.kv.put(userKey, JSON.stringify(userData));
+        
+        // Add to users list
+        const usersList = await this.kv.get('users:list');
+        let users = usersList ? JSON.parse(usersList) : [];
+        if (!users.includes(userId)) {
+            users.push(userId);
+            await this.kv.put('users:list', JSON.stringify(users));
+        }
+        
+        // Update stats
+        await this.updateStats();
+    }
+
+    async updateStats() {
+        const usersList = await this.kv.get('users:list');
+        const users = usersList ? JSON.parse(usersList) : [];
+        const today = new Date().toDateString();
+        
+        const stats = {
+            total_users: users.length,
+            last_updated: new Date().toISOString()
+        };
+        
+        await this.kv.put('stats', JSON.stringify(stats));
+    }
+
+    async getStats() {
+        const stats = await this.kv.get('stats');
+        return stats ? JSON.parse(stats) : { total_users: 0, last_updated: null };
+    }
+
+    async getAllUsers() {
+        const usersList = await this.kv.get('users:list');
+        return usersList ? JSON.parse(usersList) : [];
+    }
+}
+
+async function handleUpdate(update, env) {
     if (!update.message) return new Response('OK');
     
     const message = update.message;
     const chatId = message.chat.id;
     const userId = message.from.id;
     const text = message.text || '';
-    const username = message.from.username || `user_${userId}`;
     
-    // Save user to database
-    await saveUser(userId, username, message.from.first_name);
+    const config = getConfig(env);
+    const userManager = new UserManager(env);
+    
+    // Save user
+    await userManager.saveUser(userId, message.from.username, message.from.first_name);
     
     // Handle commands
     if (text.startsWith('/')) {
-        return handleCommand(message);
+        return await handleCommand(message, config, userManager);
     }
     
-    // Handle replies for broadcast
-    if (message.reply_to_message) {
-        return handleBroadcastReply(message);
+    // Handle broadcast replies
+    if (message.reply_to_message && text === '/broadcast') {
+        return await handleBroadcastReply(message, config, userManager);
     }
     
-    return sendMessage(chatId, `👋 Hello! Use /help to see available commands.`);
+    return await sendMessage(chatId, `👋 Hello! Use /help to see available commands.`, config);
 }
 
-async function handleCommand(message) {
+async function handleCommand(message, config, userManager) {
     const chatId = message.chat.id;
     const userId = message.from.id;
     const text = message.text;
@@ -55,36 +158,33 @@ async function handleCommand(message) {
     
     switch (command) {
         case '/start':
-            return handleStart(chatId, userId, message.from);
+            return await handleStart(chatId, userId, message.from, config);
         
         case '/help':
-            return handleHelp(chatId);
+            return await handleHelp(chatId, config);
         
         case '/trail':
-            return handleTrail(chatId, userId);
+            return await handleTrail(chatId, userId, config);
         
         case '/stats':
-            return handleStats(chatId, userId);
+            return await handleStats(chatId, userId, userManager, config);
         
         case '/broadcast':
-            return handleBroadcast(chatId, userId, text);
+            return await handleBroadcast(chatId, userId, text, config);
         
         case '/createpremium':
-            return handleCreatePremium(chatId, userId, text);
+            return await handleCreatePremium(chatId, userId, text, config);
         
         case '/checkaccount':
-            return handleCheckAccount(chatId, text);
+            return await handleCheckAccount(chatId, text, config);
         
         default:
-            return sendMessage(chatId, '❌ Unknown command. Use /help for available commands.');
+            return await sendMessage(chatId, '❌ Unknown command. Use /help for available commands.', config);
     }
 }
 
-// =========================================================================
-// COMMAND HANDLERS
-// =========================================================================
-
-async function handleStart(chatId, userId, userInfo) {
+// Command implementations (same as previous code, but with env config)
+async function handleStart(chatId, userId, userInfo, config) {
     const welcomeText = `🎉 *Welcome to Premium VPN Bot!*
 
 🤖 *Bot Features:*
@@ -107,11 +207,10 @@ async function handleStart(chatId, userId, userInfo) {
 💬 *Support:* @nkka404
 📢 *Channel:* @premium_channel_404`;
 
-    await saveUser(userId, userInfo.username, userInfo.first_name);
-    return sendMessage(chatId, welcomeText);
+    return await sendMessage(chatId, welcomeText, config);
 }
 
-async function handleHelp(chatId) {
+async function handleHelp(chatId, config) {
     const helpText = `📋 *Available Commands*
 
 👤 *User Commands:*
@@ -132,12 +231,13 @@ Example: /createpremium 100 john_doe 30 1
 2. Check status with /checkaccount
 3. Contact admin for premium accounts`;
 
-    return sendMessage(chatId, helpText);
+    return await sendMessage(chatId, helpText, config);
 }
 
-async function handleTrail(chatId, userId) {
+async function handleTrail(chatId, userId, config) {
     try {
-        const response = await fetch(`${API_BASE_URL}?trial=${userId}`);
+        const apiUrl = `${config.API_BASE_URL}?trial=${userId}`;
+        const response = await fetch(apiUrl);
         const result = await response.json();
         
         if (result.success && result.data.link) {
@@ -157,74 +257,99 @@ ${result.data.qr_code}
 💡 *Instructions:*
 1. Copy the link above
 2. Import to your V2Ray client
-3. Enjoy free premium service!
+3. Enjoy free premium service!`;
 
-⚠️ *Note:* This is a trial account. For unlimited access, contact admin.`;
-
-            return sendMessage(chatId, trailText);
+            return await sendMessage(chatId, trailText, config);
         } else {
-            return sendMessage(chatId, `❌ Failed to create trial account: ${result.data.error || 'Unknown error'}`);
+            return await sendMessage(chatId, `❌ Failed to create trial account: ${result.data.error || 'Unknown error'}`, config);
         }
     } catch (error) {
-        return sendMessage(chatId, '❌ Server error. Please try again later.');
+        return await sendMessage(chatId, '❌ Server error. Please try again later.', config);
     }
 }
 
-async function handleStats(chatId, userId) {
-    if (!ADMIN_IDS.includes(userId)) {
-        return sendMessage(chatId, '❌ Admin access required for this command.');
+async function handleStats(chatId, userId, userManager, config) {
+    const adminIds = config.ADMIN_IDS;
+    if (!adminIds.includes(userId)) {
+        return await sendMessage(chatId, '❌ Admin access required for this command.', config);
     }
     
+    const stats = await userManager.getStats();
     const statsText = `📊 *Bot Statistics*
 
 👥 *Users:*
-• Total Users: ${userDB.stats.total_users}
-• Active Today: ${userDB.stats.active_today}
-• Premium Users: ${userDB.stats.premium_users}
+• Total Users: ${stats.total_users}
+• Last Updated: ${new Date(stats.last_updated).toLocaleString()}
 
 ⚡ *System:*
 • Uptime: 99.9%
 • Response Time: < 200ms
-• Last Update: ${new Date().toLocaleString()}
+• Environment: Production
 
 🛠 *Admin Panel:*
-• Admin Count: ${ADMIN_IDS.length}
+• Admin Count: ${adminIds.length}
 • Broadcasts: Ready
-• Database: Active`;
+• Database: Cloudflare KV`;
 
-    return sendMessage(chatId, statsText);
+    return await sendMessage(chatId, statsText, config);
 }
 
-async function handleBroadcast(chatId, userId, text) {
-    if (!ADMIN_IDS.includes(userId)) {
-        return sendMessage(chatId, '❌ Admin access required for this command.');
+async function handleBroadcast(chatId, userId, text, config) {
+    const adminIds = config.ADMIN_IDS;
+    if (!adminIds.includes(userId)) {
+        return await sendMessage(chatId, '❌ Admin access required for this command.', config);
     }
     
-    if (!message.reply_to_message) {
-        return sendMessage(chatId, '📢 *Broadcast System*\n\nPlease reply to a message with /broadcast to send it to all users.\n\nSupported: Text, Photo, Document, Video');
-    }
-    
-    // In production, you would iterate through all users and send the message
-    return sendMessage(chatId, '📢 Broadcast feature ready - User iteration would happen here');
+    return await sendMessage(chatId, '📢 *Broadcast System*\n\nPlease reply to a message with /broadcast to send it to all users.', config);
 }
 
-async function handleCreatePremium(chatId, userId, text) {
-    if (!ADMIN_IDS.includes(userId)) {
-        return sendMessage(chatId, '❌ Admin access required for this command.');
+async function handleBroadcastReply(message, config, userManager) {
+    const userId = message.from.id;
+    const adminIds = config.ADMIN_IDS;
+    
+    if (!adminIds.includes(userId)) {
+        return await sendMessage(message.chat.id, '❌ Admin access required for broadcasting.', config);
+    }
+    
+    const repliedMessage = message.reply_to_message;
+    const broadcastText = `📢 *Broadcast Message*\n\n${repliedMessage.text || 'Media broadcast'}`;
+    
+    const allUsers = await userManager.getAllUsers();
+    let sentCount = 0;
+    
+    // Send to all users (with error handling)
+    for (const user of allUsers) {
+        if (parseInt(user) !== userId) { // Don't send to self
+            try {
+                await sendMessage(user, broadcastText, config);
+                sentCount++;
+                // Small delay to avoid rate limiting
+                await new Promise(resolve => setTimeout(resolve, 100));
+            } catch (error) {
+                console.error(`Failed to send to user ${user}:`, error);
+            }
+        }
+    }
+    
+    return await sendMessage(message.chat.id, `✅ Broadcast sent to ${sentCount} users.`, config);
+}
+
+async function handleCreatePremium(chatId, userId, text, config) {
+    const adminIds = config.ADMIN_IDS;
+    if (!adminIds.includes(userId)) {
+        return await sendMessage(chatId, '❌ Admin access required for this command.', config);
     }
     
     const parts = text.split(' ');
     if (parts.length < 5) {
-        return sendMessage(chatId, '💳 *Create Premium Account*\n\nUsage: /createpremium GB username days panel\n\nExample: /createpremium 100 john_doe 30 1\n\n📋 Available Panels: 1, 2, 3');
+        return await sendMessage(chatId, '💳 *Create Premium Account*\n\nUsage: /createpremium GB username days panel\n\nExample: /createpremium 100 john_doe 30 1', config);
     }
     
-    const gb = parts[1];
-    const username = parts[2];
-    const days = parts[3];
-    const panel = parts[4];
+    const [_, gb, username, days, panel] = parts;
     
     try {
-        const response = await fetch(`${API_BASE_URL}?key=${gb}&name=${username}&exp=${days}&panel=${panel}`);
+        const apiUrl = `${config.API_BASE_URL}?key=${gb}&name=${username}&exp=${days}&panel=${panel}`;
+        const response = await fetch(apiUrl);
         const result = await response.json();
         
         if (result.success) {
@@ -241,29 +366,28 @@ async function handleCreatePremium(chatId, userId, text) {
 📱 *QR Code:* 
 ${result.data.qr_code}
 
-✅ *Status:* Active
-📊 *Traffic:* 0GB used
-⏳ *Expiry:* ${result.data.expiry_days} days`;
+✅ *Status:* Active`;
 
-            return sendMessage(chatId, premiumText);
+            return await sendMessage(chatId, premiumText, config);
         } else {
-            return sendMessage(chatId, `❌ Failed to create premium account: ${result.data.error}`);
+            return await sendMessage(chatId, `❌ Failed to create premium account: ${result.data.error}`, config);
         }
     } catch (error) {
-        return sendMessage(chatId, '❌ Server error. Please try again.');
+        return await sendMessage(chatId, '❌ Server error. Please try again.', config);
     }
 }
 
-async function handleCheckAccount(chatId, text) {
+async function handleCheckAccount(chatId, text, config) {
     const parts = text.split(' ');
     if (parts.length < 2) {
-        return sendMessage(chatId, '🔍 *Check Account Status*\n\nUsage: /checkaccount YOUR_CONFIG_HERE\n\nExample: /checkaccount vmess://...');
+        return await sendMessage(chatId, '🔍 *Check Account Status*\n\nUsage: /checkaccount YOUR_CONFIG_HERE\n\nExample: /checkaccount vmess://...', config);
     }
     
-    const config = parts.slice(1).join(' ');
+    const configStr = parts.slice(1).join(' ');
     
     try {
-        const response = await fetch(`${API_BASE_URL}?config=${encodeURIComponent(config)}`);
+        const apiUrl = `${config.API_BASE_URL}?config=${encodeURIComponent(configStr)}`;
+        const response = await fetch(apiUrl);
         const result = await response.json();
         
         if (result.success) {
@@ -277,30 +401,24 @@ async function handleCheckAccount(chatId, text) {
 📶 *Traffic Usage:*
 ⬆️ Upload: ${accountInfo.traffic?.upload?.text || '0 B'}
 ⬇️ Download: ${accountInfo.traffic?.download?.text || '0 B'} 
-💾 Total: ${accountInfo.traffic?.total?.text || 'Unlimited'}
 📈 Usage: ${accountInfo.traffic?.usage_percentage || '0%'}
 
 ⏰ *Expiry:*
 ${accountInfo.expiry?.remaining_time || 'Unknown'}
-📅 Until: ${accountInfo.expiry?.expiry_date || 'Unknown'}
 
 ✅ *Status:* ${accountInfo.expiry?.status === 'active' ? '🟢 Active' : '🔴 Expired'}`;
 
-            return sendMessage(chatId, statusText);
+            return await sendMessage(chatId, statusText, config);
         } else {
-            return sendMessage(chatId, `❌ Account not found or error: ${result.data.error}`);
+            return await sendMessage(chatId, `❌ Account not found: ${result.data.error}`, config);
         }
     } catch (error) {
-        return sendMessage(chatId, '❌ Server error. Please check your configuration.');
+        return await sendMessage(chatId, '❌ Server error. Please check your configuration.', config);
     }
 }
 
-// =========================================================================
-// UTILITY FUNCTIONS
-// =========================================================================
-
-async function sendMessage(chatId, text, replyMarkup = null) {
-    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+async function sendMessage(chatId, text, config, replyMarkup = null) {
+    const url = `https://api.telegram.org/bot${config.TELEGRAM_BOT_TOKEN}/sendMessage`;
     
     const body = {
         chat_id: chatId,
@@ -314,51 +432,15 @@ async function sendMessage(chatId, text, replyMarkup = null) {
     }
     
     try {
-        await fetch(url, {
+        const response = await fetch(url, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(body)
         });
+        
+        return await response.json();
     } catch (error) {
         console.error('Error sending message:', error);
-    }
-    
-    return new Response('OK', { status: 200 });
-}
-
-async function saveUser(userId, username, firstName) {
-    // In production, use Cloudflare KV for persistence
-    if (!userDB.users.has(userId)) {
-        userDB.users.add(userId);
-        userDB.stats.total_users = userDB.users.size;
-        userDB.stats.active_today++;
+        return null;
     }
 }
-
-async function handleBroadcastReply(message) {
-    const userId = message.from.id;
-    if (!ADMIN_IDS.includes(userId)) {
-        return sendMessage(message.chat.id, '❌ Admin access required for broadcasting.');
-    }
-    
-    const repliedMessage = message.reply_to_message;
-    const broadcastText = `📢 *Broadcast Message*\n\n${repliedMessage.text || 'Media broadcast'}`;
-    
-    // Broadcast to all users (simplified example)
-    // In production, iterate through all users from database
-    for (let user of userDB.users) {
-        if (user !== userId) { // Don't send to self
-            await sendMessage(user, broadcastText);
-        }
-    }
-    
-    return sendMessage(message.chat.id, `✅ Broadcast sent to ${userDB.users.size - 1} users.`);
-}
-
-// =========================================================================
-// CLOUDFLARE WORKER SETUP
-// =========================================================================
-
-addEventListener('fetch', event => {
-    event.respondWith(handleRequest(event.request));
-});
