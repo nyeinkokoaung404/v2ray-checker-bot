@@ -1,0 +1,30 @@
+name = "telegram-vpn-bot"
+compatibility_date = "2023-12-01"
+compatibility_flags = ["nodejs_compat"]
+
+# KV Namespace for user data
+[[kv_namespaces]]
+binding = "USER_KV"
+id = "your-kv-namespace-id"
+preview_id = "your-kv-preview-id"
+
+# Environment variables
+[vars]
+TELEGRAM_BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
+ADMIN_IDS = "[123456789, 987654321]"
+API_BASE_URL = "https://yourdomain.com/api.php"
+
+# Deployment environments
+[env.production]
+vars = { 
+    TELEGRAM_BOT_TOKEN = "YOUR_PROD_BOT_TOKEN",
+    ADMIN_IDS = "[123456789, 987654321]",
+    API_BASE_URL = "https://yourdomain.com/api.php"
+}
+
+[env.staging]
+vars = { 
+    TELEGRAM_BOT_TOKEN = "YOUR_STAGING_BOT_TOKEN",
+    ADMIN_IDS = "[123456789]",
+    API_BASE_URL = "https://staging.yourdomain.com/api.php"
+}
